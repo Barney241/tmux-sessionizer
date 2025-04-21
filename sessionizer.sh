@@ -1,136 +1,156 @@
 #!/usr/bin/env bash
 
 # --- Configuration ---
-# Set the directory where your projects are stored.
-# If PROJECTS_DIR environment variable is set, use it; otherwise, default to ~/Projects
 PROJECTS_DIR="${PROJECTS_DIR:-$HOME/Projects}"
-# Set the maximum depth for scanning project directories
-PROJECT_SCAN_DEPTH=3 # Adjust as needed (e.g., 2 for ~/Projects/Type/ProjectName)
+PROJECT_SCAN_DEPTH=3
 
 # --- Safety Checks ---
-if ! command -v tmux &> /dev/null; then
-    echo "Error: tmux is not installed." >&2
-    exit 1
-fi
-
-if ! command -v fzf &> /dev/null; then
-    echo "Error: fzf is not installed." >&2
-    exit 1
-fi
-
-if [[ ! -d "$PROJECTS_DIR" ]]; then
-    echo "Error: Projects directory '$PROJECTS_DIR' not found." >&2
-    echo "Set the PROJECTS_DIR environment variable or change the script default." >&2
-    exit 1
-fi
+if ! command -v tmux &> /dev/null; then echo "Error: tmux not installed." >&2; exit 1; fi
+if ! command -v fzf &> /dev/null; then echo "Error: fzf not installed." >&2; exit 1; fi
+if ! command -v awk &> /dev/null; then echo "Error: awk not installed." >&2; exit 1; fi
+if [[ ! -d "$PROJECTS_DIR" ]]; then echo "Error: Projects directory '$PROJECTS_DIR' not found." >&2; exit 1; fi
 
 # --- Helper Functions ---
-
-# Function to sanitize session names (tmux doesn't like '.' or ':')
 sanitize_session_name() {
     echo "$1" | sed 's/[.:]/_/g'
 }
+DELIMITER="|"
 
 # --- Main Logic ---
 
 # 1. Get active tmux sessions
-#    Format: "session_name [Active]"
-active_sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | sed 's/$/ \[Active]/')
+active_sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | sed "s/$/$DELIMITER\[Active]$DELIMITER/")
 
 # 2. Find potential project sessions (Git repositories)
-#    Find git dirs, get parent dir path, then format as "basename --- /full/path [Project]"
-#    Using find ... -print0 | xargs -0 is safer for names with spaces/special chars
 found_projects=$(find "$PROJECTS_DIR" -mindepth 1 -maxdepth "$PROJECT_SCAN_DEPTH" -type d -name .git -print0 2>/dev/null | \
     xargs -0 -I {} dirname "{}" | \
     while IFS= read -r path; do
         basename=$(basename "$path")
-        # Skip if basename is empty or just '.'
         [[ -z "$basename" || "$basename" == "." ]] && continue
         sanitized_name=$(sanitize_session_name "$basename")
-        echo "$sanitized_name --- $path [Project]" # Store name and path, separated
+        # Store sanitized name, tag, separator, and path
+        echo "$sanitized_name$DELIMITER$DELIMITER$path"
     done
 )
 
-# 3. Combine active sessions and project paths
-#    Use awk to extract just the session/project name for comparison and uniqueness
-combined_list=$( (echo "$active_sessions"; echo "$found_projects") | \
-    awk -F ' --- ' '{print $1}' | \
-    sort -u)
+# 3. Combine active sessions and project paths for fzf input
+#    Format: "DisplayName---[Active]---DataPart"
+#    - Sessions: "SessionName---[Active]---" (DataPart is empty)
+#    - Projects: "ProjectName------ /path/to/project" active part is empty
+combined_list_for_fzf=$(
+    echo "$active_sessions"
+    echo "$found_projects"
+)
 
 # If no sessions or projects found, exit
-if [[ -z "$combined_list" ]]; then
+if [[ -z "$combined_list_for_fzf" ]]; then
   echo "No active sessions or projects found in '$PROJECTS_DIR'."
   exit 0
 fi
 
+# Simpler Awk approach for prioritization:
+combined_list_for_fzf=$(echo "$combined_list_for_fzf" | \
+    awk -F "$DELIMITER" '
+    BEGIN { OFS=FS } # Keep the output field separator the same as input
+    {
+        name = $1
+        is_active = ($2 == "[Active]")
 
-# 4. Use fzf to select a session/project
-#    Use --query="$1" to pre-fill fzf if an argument is passed to the script
-#    Use awk magic to re-format the combined list for fzf display
-#    FZF displays "Name [Type]" but returns the original full line ("Name [Active]" or "Name --- Path [Project]")
-selected_output=$( (echo "$active_sessions"; echo "$found_projects") | \
-    awk -F ' --- ' '{
-        if (NF==1) { # Active session line ("Name [Active]")
-            print $0 # Keep as is
-        } else { # Project line ("Name --- Path [Project]")
-            print $1 $NF " --- " $2 # Format for display: "Name[Project] --- Path" -> Returns "Name --- Path [Project]"
+        # If we see an active session, store it and mark it as preferred
+        if (is_active) {
+            lines[name] = $0
+            preferred[name] = 1
         }
-    }' | \
-    sort | \
-    fzf --reverse --prompt="Select Tmux Session/Project > " \
+        # If we see a non-active session, only store it if no preferred (active) version exists for this name
+        else if (!(name in preferred)) {
+            lines[name] = $0
+        }
+    }
+    END {
+        # Print the stored lines (active ones took precedence)
+        for (name in lines) {
+            print lines[name]
+        }
+    }
+')
+
+
+# If deduplication resulted in an empty list (unlikely but possible)
+if [[ -z "$combined_list_for_fzf" ]]; then
+  echo "No unique sessions or projects found after deduplication."
+  exit 0
+fi
+
+combined_list_for_fzf=$(echo "$combined_list_for_fzf" | sort --field-separator "$DELIMITER" -k2,2r -k1,1)
+
+echo "$combined_list_for_fzf"
+
+#4. Use fzf to select
+selected_output=$( echo "$combined_list_for_fzf" | \
+    fzf --prompt="Select Tmux Session/Project > " \
+        --delimiter "$DELIMITER" --with-nth '{1} {2}' \
+        --tiebreak=index \
         --preview '
-            LINE=$(echo {} | sed "s/ \[.*\]//"); # Remove type tag for processing
-            if echo "$LINE" | grep -q " --- "; then # Project
-                PROJECT_PATH=$(echo "$LINE" | awk -F " --- " "{print \$2}");
-                echo "Project Path: $PROJECT_PATH";
-                echo "---";
-                (ls -lah "$PROJECT_PATH" | head -n 10); # Show directory listing preview
-                echo "---";
-                (git -C "$PROJECT_PATH" log --oneline --graph --decorate --all -n 10 2>/dev/null) # Show git log preview
-            else # Active Session
-                SESSION_NAME=$(echo "$LINE" | awk "{print \$1}");
-                echo "Active Session: $SESSION_NAME";
-                echo "---";
-                tmux list-windows -t "$SESSION_NAME" -F "#{window_index}: #{window_name} #{?window_active,(active),}" ; # Show windows
-                echo "---";
-                tmux capture-pane -pt "$SESSION_NAME":. -S -10 # Show some pane content
-            fi' \
-        --bind 'ctrl-d:preview-down,ctrl-u:preview-up' \
-        --query="$1" --select-1 --exit-0 )
+            if [[ {2} == "[Active]" ]]; then
+                echo "Active Session: $NAME";
+                echo "--- Windows ---"
+                tmux list-windows -t {1} -F "#{window_index}: #{window_name} #{?window_active,(active),}" ;
+                echo "--- Last Pane Content (Bottom 10 lines) ---"
+                tmux capture-pane -pt {1}:. -S -10
+            elif [[ -n {3} ]]; then
+                echo "Project: {1}";
+                echo "Path: {3}";
+                echo "--- Contents (Top 10) ---"
+                (ls -lah {3} 2>/dev/null | head -n 10);
+                echo "--- Git Log (Last 10) ---"
+                (git -C {3} log --oneline --graph --decorate --all -n 10 2>/dev/null || echo "Not a git repo or no history.")
+            else
+                # {..} is the fzf placeholder for the original full line
+                echo "Unknown type: {..}"
+            fi
+
+        ' \
+        --query "$1" --select-1 --exit-0 )
 
 
-# Exit if fzf was cancelled (e.g., Esc)
+# Exit if fzf was cancelled
 if [[ -z "$selected_output" ]]; then
     exit 0
 fi
 
-# 5. Process the selection
 
+# 5. Process the selection
+#    Selected_output contains the full line "DisplayPart --- DataPart"
 is_project=0
 selected_name=""
 project_path=""
+display_part=$(echo "$selected_output" | awk -F "$DELIMITER" '{print $1}')
+data_part=$(echo "$selected_output" | awk -F "$DELIMITER" '{print $3}')
 
-# Check if the selection contains the '---' separator, indicating a project path
-if echo "$selected_output" | grep -q " --- "; then
+if [[ -n "$data_part" ]]; then # Project - data_part contains the path
     is_project=1
-    selected_name=$(echo "$selected_output" | awk -F ' --- ' '{print $1}')
-    project_path=$(echo "$selected_output" | awk -F ' --- ' '{print $2}' | sed 's/ \[Project\]$//') # Extract path and remove tag
-else
-    # It's an active session, extract the name (remove '[Active]')
-    selected_name=$(echo "$selected_output" | sed 's/ \[Active\]$//')
+    project_path="$data_part"
+    selected_name=$(echo "$display_part" | sed 's/ \[Project\]$//') # Extract name from display part
+else # Session - data_part is empty
+    is_project=0
+    selected_name=$(echo "$display_part" | sed 's/ \[Active\]$//') # Extract name from display part
 fi
 
-# Check if the selected session already exists
+# Ensure selected_name is not empty (basic sanity check)
+if [[ -z "$selected_name" ]]; then
+    echo "Error: Could not determine session/project name from selection." >&2
+    exit 1
+fi
+
+# Check if the session already exists (using the extracted name)
 session_exists=$(tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -Fx "$selected_name")
 
 if [[ -n "$session_exists" ]]; then
     # Session exists - Attach or Switch
     if [[ -z "$TMUX" ]]; then
-        # Not inside tmux - attach
         echo "Attaching to existing session: $selected_name"
         tmux attach-session -t "$selected_name"
     else
-        # Inside tmux - switch client
         echo "Switching to existing session: $selected_name"
         tmux switch-client -t "$selected_name"
     fi
@@ -138,36 +158,27 @@ else
     # Session does not exist - Must be a project selection to create a new one
     if [[ "$is_project" -eq 1 ]] && [[ -n "$project_path" ]] && [[ -d "$project_path" ]]; then
         echo "Creating and attaching to new session: $selected_name"
-
-        # Create detached session, cd to project dir, name first window 'nvim'
         tmux new-session -ds "$selected_name" -c "$project_path" -n nvim
-        # Send nvim command to the first window (index 0, named nvim)
         tmux send-keys -t "$selected_name:nvim" "nvim" C-m
-
-        # Create and name the second window 'lazygit'
         tmux new-window -t "$selected_name": -c "$project_path" -n lazygit
-        # Send lazygit command to the second window
         tmux send-keys -t "$selected_name:lazygit" "lazygit" C-m
-
-        # Create and name the third window 'shell1'
         tmux new-window -t "$selected_name": -c "$project_path" -n shell1
-        # (It starts with an empty shell)
-
-        # Create and name the fourth window 'shell2'
         tmux new-window -t "$selected_name": -c "$project_path" -n shell2
-        # (It starts with an empty shell)
-
-        # Select the first window (nvim) to be active when attaching
         tmux select-window -t "$selected_name:nvim"
 
-        # Attach or Switch to the newly created session
         if [[ -z "$TMUX" ]]; then
             tmux attach-session -t "$selected_name"
         else
             tmux switch-client -t "$selected_name"
         fi
-    else
+    elif [[ "$is_project" -eq 1 ]]; then
+         # Project was selected, but path is invalid (should be caught earlier, but belt-and-suspenders)
         echo "Error: Selected project path '$project_path' for '$selected_name' is invalid or not found." >&2
+        exit 1
+    else
+        # This case means an active session was selected but doesn't actually exist?
+        # Should theoretically not happen if list-sessions was accurate.
+        echo "Error: Selected session '$selected_name' not found, and it wasn't identified as a project." >&2
         exit 1
     fi
 fi
