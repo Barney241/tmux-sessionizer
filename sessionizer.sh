@@ -83,7 +83,7 @@ fi
 
 combined_list_for_fzf=$(echo "$combined_list_for_fzf" | sort --field-separator "$DELIMITER" -k2,2r -k1,1)
 
-echo "$combined_list_for_fzf"
+#echo "$combined_list_for_fzf" # Debugging output removed/commented
 
 #4. Use fzf to select
 selected_output=$( echo "$combined_list_for_fzf" | \
@@ -91,19 +91,29 @@ selected_output=$( echo "$combined_list_for_fzf" | \
         --delimiter "$DELIMITER" --with-nth '{1} {2}' \
         --tiebreak=index \
         --preview '
-            if [[ {2} == "[Active]" ]]; then
-                echo "Active Session: $NAME";
+            # Use full paths to commands provided by Nix dependencies
+            _tmux=$(command -v tmux)
+            _ls=$(command -v ls)
+            _head=$(command -v head)
+            _git=$(command -v git)
+
+            name={1}
+            type={2}
+            path={3}
+
+            if [[ "$type" == "[Active]" ]]; then
+                echo "Active Session: $name";
                 echo "--- Windows ---"
-                tmux list-windows -t {1} -F "#{window_index}: #{window_name} #{?window_active,(active),}" ;
+                $_tmux list-windows -t "$name" -F "#{window_index}: #{window_name} #{?window_active,(active),}" ;
                 echo "--- Last Pane Content (Bottom 10 lines) ---"
-                tmux capture-pane -pt {1}:. -S -10
-            elif [[ -n {3} ]]; then
-                echo "Project: {1}";
-                echo "Path: {3}";
+                $_tmux capture-pane -pt "$name":. -S -10
+            elif [[ -n "$path" ]]; then
+                echo "Project: $name";
+                echo "Path: $path";
                 echo "--- Contents (Top 10) ---"
-                (ls -lah {3} 2>/dev/null | head -n 10);
+                ($_ls -lah "$path" 2>/dev/null | $_head -n 10);
                 echo "--- Git Log (Last 10) ---"
-                (git -C {3} log --oneline --graph --decorate --all -n 10 2>/dev/null || echo "Not a git repo or no history.")
+                ($_git -C "$path" log --oneline --graph --decorate --all -n 10 2>/dev/null || echo "Not a git repo or no history.")
             else
                 # {..} is the fzf placeholder for the original full line
                 echo "Unknown type: {..}"
@@ -130,10 +140,10 @@ data_part=$(echo "$selected_output" | awk -F "$DELIMITER" '{print $3}')
 if [[ -n "$data_part" ]]; then # Project - data_part contains the path
     is_project=1
     project_path="$data_part"
-    selected_name=$(echo "$display_part" | sed 's/ \[Project\]$//') # Extract name from display part
+    selected_name="$display_part" # Use display part directly as sanitized name
 else # Session - data_part is empty
     is_project=0
-    selected_name=$(echo "$display_part" | sed 's/ \[Active\]$//') # Extract name from display part
+    selected_name="$display_part" # Use display part directly as session name
 fi
 
 # Ensure selected_name is not empty (basic sanity check)
@@ -157,11 +167,16 @@ if [[ -n "$session_exists" ]]; then
 else
     # Session does not exist - Must be a project selection to create a new one
     if [[ "$is_project" -eq 1 ]] && [[ -n "$project_path" ]] && [[ -d "$project_path" ]]; then
-        echo "Creating and attaching to new session: $selected_name"
+        echo "Creating and attaching to new session: $selected_name based on project $project_path"
+        # Need full path for nvim and lazygit if they are expected to be specific versions or installed via Nix
+        # Assuming standard names for now
+        _nvim=$(command -v nvim || echo nvim)
+        _lazygit=$(command -v lazygit || echo lazygit)
+
         tmux new-session -ds "$selected_name" -c "$project_path" -n nvim
-        tmux send-keys -t "$selected_name:nvim" "nvim" C-m
+        tmux send-keys -t "$selected_name:nvim" "$_nvim" C-m
         tmux new-window -t "$selected_name": -c "$project_path" -n lazygit
-        tmux send-keys -t "$selected_name:lazygit" "lazygit" C-m
+        tmux send-keys -t "$selected_name:lazygit" "$_lazygit" C-m
         tmux new-window -t "$selected_name": -c "$project_path" -n shell1
         tmux new-window -t "$selected_name": -c "$project_path" -n shell2
         tmux select-window -t "$selected_name:nvim"
